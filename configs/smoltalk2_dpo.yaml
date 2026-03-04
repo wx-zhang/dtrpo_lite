@@ -1,0 +1,21 @@
+
+seed: 42
+datasets:                     
+  - id: HuggingFaceTB/smoltalk2
+    config: Preference
+    split: llama_3.1_tulu_3_8b_preference_mixture_no_think     
+    columns:
+      - chosen
+      - rejected
+      - prompt
+      - chat_template_kwargs
+    weight: 0.5
+  - id: HuggingFaceTB/smoltalk2
+    config: Preference
+    split: tulu_3_8b_pref_mix_Qwen3_32B_Qwen3_0.6B_think 
+    columns:
+      - chosen
+      - rejected
+      - prompt
+      - chat_template_kwargs
+    weight: 0.25
