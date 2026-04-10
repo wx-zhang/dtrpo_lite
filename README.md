@@ -1,6 +1,6 @@
 # dTRPO: Trajectory Reduction in Policy Optimization of Diffusion Large Language Models
 
-[![arXiv](https://img.shields.io/badge/Paper-arXiv-red.svg)](https://arxiv.org/abs/TODO)
+[![arXiv](https://img.shields.io/badge/Paper-arXiv-red.svg)](https://arxiv.org/abs/2603.18806)
 [![Model](https://img.shields.io/badge/%F0%9F%A4%97-Model-yellow)](https://huggingface.co/TODO)
 
 dTRPO designs two-stage trajectory reduction techniques to enable efficient policy optimization of diffusion large language models (dLLMs):
@@ -10,7 +10,7 @@ dTRPO designs two-stage trajectory reduction techniques to enable efficient poli
 ## 📰 News
 
 - **[2025/03]** Training code released.
-- **[2025/03]** Paper available on [arXiv](https://arxiv.org/abs/TODO).
+- **[2025/03]** Paper available on [arXiv](https://arxiv.org/abs/2603.18806).
 
 ## 🔬 Method Overview
 
