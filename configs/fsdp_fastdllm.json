@@ -1,0 +1,5 @@
+{
+  "transformer_layer_cls_to_wrap": ["Fast_dLLM_QwenDecoderLayer"],
+  "activation_checkpointing": true,
+  "use_orig_params": true
+}

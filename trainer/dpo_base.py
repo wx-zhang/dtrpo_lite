@@ -11,7 +11,6 @@ log-likelihood estimator
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Union
 
@@ -20,9 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import PartialState
 from datasets import Dataset, IterableDataset
-from torch import autocast
 from transformers import (
-    AutoProcessor,
     AutoTokenizer,
     BaseImageProcessor,
     FeatureExtractionMixin,
@@ -31,10 +28,8 @@ from transformers import (
     ProcessorMixin,
 )
 from transformers.data.data_collator import DataCollatorMixin
-from transformers.models.auto.modeling_auto import MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES
 from trl import DPOTrainer
 from trl.trainer.dpo_config import DPOConfig
-from trl.trainer.dpo_trainer import cap_exp, FDivergenceConstants, FDivergenceType
 from trl.trainer.utils import pad
 from trainer.trl_compat import flush_left, flush_right, maybe_apply_chat_template, maybe_extract_prompt
 
@@ -54,10 +49,7 @@ class DLDPOConfig(DPOConfig):
         default="sigmoid",
         metadata={"help": "Loss type for DPO training."},
     )
-    max_completion_length: Optional[int] = field(
-        default=None,
-        metadata={"help": "Maximum length of the completion."},
-    )
+
     mc_samples: int = 2
     mc_batch_size: int = 1
     mask_token_id: int = 0
@@ -111,16 +103,20 @@ class DataCollatorAndTokenizerForPreference(DataCollatorMixin):
         # {"prompt": str, "chosen": str, "rejected": str, ...}
 
         # Tokenize on-the-fly
-        tokenized = [self.process_fcn(
-            ex, **self.process_fcn_kwargs) for ex in examples]
+        tokenized = []
+        for ex in examples:
+            process_kwargs = dict(self.process_fcn_kwargs)
+            if ex.get("_is_chat_template_applied") is not None:
+                process_kwargs["is_chat"] = bool(ex["_is_chat_template_applied"])
+            tokenized.append(self.process_fcn(ex, **process_kwargs))
 
         # Convert to tensors
         prompt_input_ids = [torch.tensor(
-            e["prompt_input_ids"]) for e in tokenized]
+            e["prompt_input_ids"], dtype=torch.long) for e in tokenized]
         chosen_input_ids = [torch.tensor(
-            e["chosen_input_ids"]) for e in tokenized]
+            e["chosen_input_ids"], dtype=torch.long) for e in tokenized]
         rejected_input_ids = [torch.tensor(
-            e["rejected_input_ids"]) for e in tokenized]
+            e["rejected_input_ids"], dtype=torch.long) for e in tokenized]
 
         prompt_attention_mask = [torch.ones_like(x) for x in prompt_input_ids]
         chosen_attention_mask = [torch.ones_like(x) for x in chosen_input_ids]
@@ -198,18 +194,19 @@ class DLDPOTrainer(DPOTrainer):
         processing_class=None,
         **kwargs,
     ):
-        self.is_vision_model = (
-            model.config.model_type in MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES.keys()
-        )
+        self.is_vision_model = False
         model_id = model.config._name_or_path
         if processing_class is None:
-            processing_class = AutoProcessor.from_pretrained(model_id)
-        processing_class = AutoTokenizer.from_pretrained(model_id)
+            processing_class = AutoTokenizer.from_pretrained(
+                model_id, fix_mistral_regex=True,
+            )
+        if processing_class.pad_token_id is None:
+            processing_class.pad_token = processing_class.eos_token
 
         process_fcn_kwargs = {
             "processing_class": processing_class,
             "max_prompt_length": args.max_prompt_length,
-            "max_completion_length": args.max_completion_length,
+            "max_completion_length": args.max_length,
             "add_special_tokens": False,
         }
         data_collator = DataCollatorAndTokenizerForPreference(
@@ -217,7 +214,7 @@ class DLDPOTrainer(DPOTrainer):
             process_fcn=self.tokenize_row
             if not self.is_vision_model
             else self.process_row,
-            pad_token_id=processing_class.pad_token_id or processing_class.eos_token_id,
+            pad_token_id=processing_class.pad_token_id,
         )
 
         super().__init__(
@@ -262,7 +259,13 @@ class DLDPOTrainer(DPOTrainer):
             map_kwargs["num_proc"] = args.dataset_num_proc
             map_kwargs["writer_batch_size"] = 10
 
-        with PartialState().main_process_first():
+        state = PartialState()
+        if isinstance(dataset, Dataset):
+            # Mapped caches can be shared by checkouts with different preprocessing
+            # implementations. Rebuild on rank 0, then let other ranks load its output.
+            map_kwargs["load_from_cache_file"] = not state.is_main_process
+
+        with state.main_process_first():
             # Extract prompt if needed
             if isinstance(
                 dataset, Dataset
@@ -298,22 +301,8 @@ class DLDPOTrainer(DPOTrainer):
     ):
         raise NotImplementedError("Subclasses must implement this method")
 
-    def concatenated_forward_with_random_masking(
-        self,
-        model: nn.Module,
-        batch: dict[str, torch.Tensor],
-        *,
-        mc_samples: int = None,
-        mc_batch_size: int = None,
-        mask_token_id: int = None,
-        cfg_scale: float = None,
-    ) -> dict[str, torch.Tensor]:
-        """
-        Decoder-only path: compute chosen/rejected scores via MC masked-token estimator.
-        - Randomly mask some completion tokens in each pass.
-        - Predict masked tokens and debias by 1/p (p = masked_fraction).
-        - Average across MC samples to get sequence scores.
-        """
+    def _prepare_preference_inputs(self, batch):
+        """Concatenate preference pairs, truncate and align their loss masks."""
         assert (
             not self.is_encoder_decoder
         ), "Encoder–decoder path is not implemented in this trainer."
@@ -339,6 +328,7 @@ class DLDPOTrainer(DPOTrainer):
         input_ids = torch.cat(
             (prompt_input_ids, completion_input_ids), dim=1
         )  # [2B, L]
+        input_ids = input_ids.to(dtype=torch.long)
         attention_mask = torch.cat(
             (prompt_attention_mask, completion_attention_mask), dim=1
         )  # [2B, L]
@@ -374,6 +364,28 @@ class DLDPOTrainer(DPOTrainer):
                 attention_mask, input_ids, loss_mask
             )
 
+        return input_ids, attention_mask, loss_mask, num_examples
+
+    def concatenated_forward_with_random_masking(
+        self,
+        model: nn.Module,
+        batch: dict[str, torch.Tensor],
+        *,
+        mc_samples: int = None,
+        mc_batch_size: int = None,
+        mask_token_id: int = None,
+        cfg_scale: float = None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Decoder-only path: compute chosen/rejected scores via MC masked-token estimator.
+        - Randomly mask some completion tokens in each pass.
+        - Predict masked tokens and debias by 1/p (p = masked_fraction).
+        - Average across MC samples to get sequence scores.
+        """
+        input_ids, attention_mask, loss_mask, num_examples = (
+            self._prepare_preference_inputs(batch)
+        )
+
         # prepare ref model as it shares the same mc_samples as the model
         ref_model = self.ref_model if self.ref_model is not None else self.model
 
@@ -402,9 +414,9 @@ class DLDPOTrainer(DPOTrainer):
             )
 
             logpb_full = logpb_full.view(B2, r)
-            logpbs_sum += logpb_full.mean(dim=1)
+            logpbs_sum += logpb_full.sum(dim=1)
             ref_logpb_full = ref_logpb_full.view(B2, r)
-            ref_logpbs_sum += ref_logpb_full.mean(dim=1)
+            ref_logpbs_sum += ref_logpb_full.sum(dim=1)
 
             repeats_done += r
 
@@ -482,7 +494,7 @@ class DLDPOTrainer(DPOTrainer):
 
             # Cross-entropy at masked positions only
             masked_ce = F.cross_entropy(
-                logits[mask_positions],   # [M, V]
+                logits[mask_positions].float(),   # [M, V]
                 targets[mask_positions],  # [M]
                 reduction="none",
             )  # [M]
@@ -503,32 +515,39 @@ class DLDPOTrainer(DPOTrainer):
             # (the most confident ones).  The per-step log-prob contribution is
             # approximated as:  block_size * Σ log p(y*_t)  over unmasked positions.
             # Summing over steps gives an estimate of log p(y).
-            log_probs         = torch.log_softmax(logits, dim=-1)  # [N, B, V]
-            target_token_logp = log_probs.gather(
+            # Upcast for scoring: bf16 log_softmax can quantize target log-probs
+            # enough to change DPO log-ratios and near-tie top-k selection.
+            logits_f = logits.float()
+            target_token_logp = logits_f.gather(
                 dim=-1, index=targets.unsqueeze(-1)
-            ).squeeze(-1)  # [N, B]  log p(target_t) at every position
+            ).squeeze(-1) - torch.logsumexp(logits_f, dim=-1)  # [N, B]
 
-            # Restrict scoring to masked (unknown) positions
-            conf = target_token_logp.masked_fill(~mask_positions, float("-inf"))  # [N, B]
+            k = min(max(1, self.args.unmask_size), target_token_logp.size(1))
+            if kwargs.get("unmask_positions", None) is not None:
+                # we have computed the unmask positions in policy prob
+                # in the ref prob, we will use the same unmask positions to compute the logp
+                unmask_positions = kwargs["unmask_positions"]  # [N, B]
+            else:
+                # Restrict scoring to masked (unknown) positions
+                conf = target_token_logp.masked_fill(~mask_positions, float("-inf"))  # [N, B]
 
-            # Select the top `unmask_size` most-confident masked positions to "unmask"
-            k = min(max(1, self.args.unmask_size), conf.size(1))
-            _, topk_indices = torch.topk(conf, k, dim=1)  # [N, k]
+                _, topk_indices = torch.topk(conf, k, dim=1)  # [N, k]
 
-            # Build boolean unmask mask; rows with no masked tokens (all -inf) are skipped
-            valid_rows      = ~torch.all(torch.isinf(conf), dim=1)          # [N]
-            topk_indices    = topk_indices * valid_rows.unsqueeze(1)
-            unmask_positions = torch.zeros(N, logits.shape[1], dtype=torch.bool, device=logits.device)
-            unmask_positions.scatter_(1, topk_indices, True)
-            unmask_positions = unmask_positions & mask_positions  # stay within masked region
+                # Build boolean unmask mask; rows with no masked tokens (all -inf) are skipped
+                valid_rows      = ~torch.all(torch.isinf(conf), dim=1)          # [N]
+                topk_indices    = topk_indices * valid_rows.unsqueeze(1)
+                unmask_positions = torch.zeros(N, logits.shape[1], dtype=torch.bool, device=logits.device)
+                unmask_positions.scatter_(1, topk_indices, True)
+                unmask_positions = unmask_positions & mask_positions  # stay within masked region
 
-            # Per-step contribution: block_size * Σ log p(y*) at unmasked positions
+            # Per-step DTRPO contribution: block_size times the selected top-k log-probs.
             per_pos_logp = target_token_logp * unmask_positions  # [N, B]
-            block_logp   = block_size * per_pos_logp.sum(dim=1)  # [N]
+            selected_logp = per_pos_logp.sum(dim=1)  # [N]
+            block_logp = block_size * selected_logp
 
             if self.args.loss_type == "ipo":
                 # IPO normalises by the number of unmasked tokens instead of block_size
-                block_logp = per_pos_logp.sum(dim=1) / max(k, 1)
+                block_logp = selected_logp / max(k, 1)
 
             logp = block_logp  # [N]
 
@@ -545,6 +564,7 @@ class DLDPOTrainer(DPOTrainer):
         log_dict = {
             "sum_logp_chosen":   logp[:N_seq // 2],
             "sum_logp_rejected": logp[N_seq // 2:],
+            "unmask_positions": unmask_positions.detach() if self.args.logp_type == "dtrpo" else None,
         }
         return logp, log_dict
 
@@ -591,6 +611,8 @@ class DLDPOTrainer(DPOTrainer):
             rejected_rewards = rejected_rewards + _rejected_rewards * weight
 
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
+        chosen_logratios = model_output["chosen_logps"] - model_output["chosen_logps_ref"]
+        rejected_logratios = model_output["rejected_logps"] - model_output["rejected_logps_ref"]
 
         if self.args.rpo_alpha is not None:
             losses = (
@@ -632,6 +654,24 @@ class DLDPOTrainer(DPOTrainer):
         metrics[f"{prefix}rewards/margins"] = (
             self.accelerator.gather_for_metrics(
                 chosen_rewards - rejected_rewards)
+            .mean()
+            .item()
+        )
+        metrics[f"{prefix}logratios/chosen"] = (
+            self.accelerator.gather_for_metrics(chosen_logratios)
+            .detach()
+            .mean()
+            .item()
+        )
+        metrics[f"{prefix}logratios/rejected"] = (
+            self.accelerator.gather_for_metrics(rejected_logratios)
+            .detach()
+            .mean()
+            .item()
+        )
+        metrics[f"{prefix}logratios/margins"] = (
+            self.accelerator.gather_for_metrics(chosen_logratios - rejected_logratios)
+            .detach()
             .mean()
             .item()
         )
@@ -715,269 +755,3 @@ class DLDPOTrainer(DPOTrainer):
             )
 
         return losses.mean(), metrics
-
-    def dpo_loss(
-        self,
-        chosen_logps: torch.FloatTensor,
-        rejected_logps: torch.FloatTensor,
-        ref_chosen_logps: torch.FloatTensor,
-        ref_rejected_logps: torch.FloatTensor,
-        loss_type: str = "sigmoid",
-        model_output: dict[str, torch.FloatTensor] = None,
-    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
-        """
-        Compute the DPO loss for a batch of policy and reference model log probabilities.
-
-        Args:
-            chosen_logps (`torch.FloatTensor`):
-                Log probabilities of the model for the chosen responses. Shape: `(batch_size,)`.
-            rejected_logps (`torch.FloatTensor`):
-                Log probabilities of the model for the rejected responses. Shape: `(batch_size,)`.
-            ref_chosen_logps (`torch.FloatTensor`):
-                Log probabilities of the reference model for the chosen responses. Shape: `(batch_size,)`.
-            ref_rejected_logps (`torch.FloatTensor`):
-                Log probabilities of the reference model for the rejected responses. Shape: `(batch_size,)`.
-            loss_type (`str`, defaults to `"sigmoid"`):
-                The type of loss to compute. One of:
-                - `"sigmoid"`: Sigmoid loss from the original [DPO](https://huggingface.co/papers/2305.18290) paper.
-                - `"hinge"`: Hinge loss on the normalized likelihood from the
-                  [SLiC](https://huggingface.co/papers/2305.10425) paper.
-                - `"ipo"`: IPO loss from the [IPO](https://huggingface.co/papers/2310.12036) paper.
-                - `"exo_pair"`: Pairwise EXO loss from the [EXO](https://huggingface.co/papers/2402.00856) paper.
-                - `"nca_pair"`: Pairwise NCA loss from the [NCA](https://huggingface.co/papers/2402.05369) paper.
-                - `"robust"`: Unbiased estimate of the DPO loss that is robust to preference noise from the [Robust
-                  DPO](https://huggingface.co/papers/2403.00409) paper.
-                - `"bco_pair"`: Pairwise BCO loss from the [BCO](https://huggingface.co/papers/2404.04656) paper.
-                - `"sppo_hard"`: SPPO loss with hard label from the [SPPO](https://huggingface.co/papers/2405.00675)
-                  paper.
-                - `"aot"`: AOT loss for paired datasets from the [AOT](https://huggingface.co/papers/2406.05882) paper.
-                - `"aot_pair"`: AOT loss for unpaired datasets from the [AOT](https://huggingface.co/papers/2406.05882)
-                  paper.
-                - `"discopop"`: DiscoPOP (a.k.a Log-Ratio Modulated Loss, LRML) loss from the
-                  [DiscoPOP](https://huggingface.co/papers/2406.08414) paper.
-                - `"apo_zero"`: APO-zero loss from the [APO](https://huggingface.co/papers/2408.06266) paper.
-                - `"apo_down"`: APO-down loss from the [APO](https://huggingface.co/papers/2408.06266) paper.
-                - `"sft"`: Negative log-likelihood loss (standard supervised fine-tuning loss).
-            model_output (`dict[str, torch.FloatTensor]`, *optional*):
-                The output of the model's forward pass. This is used to compute auxiliary losses if enabled.
-
-        Returns:
-            A tuple of three tensors: `(losses, chosen_rewards, rejected_rewards)`. The losses tensor contains the DPO
-            loss for each example in the batch. The `chosen_rewards` and `rejected_rewards` tensors contain the rewards
-            for the chosen and rejected responses, respectively.
-        """
-        device = self.accelerator.device
-
-        # Get the log ratios for the chosen and rejected responses
-        chosen_logratios = chosen_logps.to(device) - (
-            not self.reference_free
-        ) * ref_chosen_logps.to(device)
-        rejected_logratios = rejected_logps.to(device) - (
-            not self.reference_free
-        ) * ref_rejected_logps.to(device)
-
-        if self.f_divergence_type == FDivergenceType.ALPHA_DIVERGENCE.value:
-            # The alpha-divergence formula: (1 - u^-alpha) / alpha
-            # The divergence difference between the chosen and rejected sample is:
-            #     (1 - u[w]^-alpha) / alpha - (1 - u[l]^-alpha) / alpha
-            #        = (u[l]^-alpha - u[w]^-alpha) / alpha
-            # where u[w] and u[l] are the policy/reference probability ratios
-            # for the chosen and rejected samples, respectively.
-            alpha_coef = FDivergenceConstants.ALPHA_DIVERGENCE_COEF_DEFAULT
-            if (
-                self.f_divergence_params
-                and FDivergenceConstants.ALPHA_DIVERGENCE_COEF_KEY
-                in self.f_divergence_params
-            ):
-                alpha_coef = float(
-                    self.f_divergence_params[
-                        FDivergenceConstants.ALPHA_DIVERGENCE_COEF_KEY
-                    ]
-                )
-            logits = (
-                cap_exp(rejected_logratios * -alpha_coef)
-                - cap_exp(chosen_logratios * -alpha_coef)
-            ) / alpha_coef
-        else:
-            logratios = chosen_logps - rejected_logps
-            if self.reference_free:
-                ref_logratios = torch.tensor(
-                    [0], dtype=logratios.dtype, device=logratios.device
-                )
-            else:
-                ref_logratios = ref_chosen_logps - ref_rejected_logps
-
-            logratios = logratios.to(self.accelerator.device)
-            ref_logratios = ref_logratios.to(self.accelerator.device)
-            logits = logratios - ref_logratios
-
-            if self.f_divergence_type == FDivergenceType.JS_DIVERGENCE.value:
-                # The js-divergence formula: log(2 * u / (1 + u))
-                # The divergence difference between the chosen and rejected sample is:
-                #     log(2 * u[w] / (1 + u[w])) - log(2 * u[l] / (1 + u[l]))
-                #       = log(u[w]) - log(u[l]) - (log(1 + u[w]) - log(1 + u[l]))
-                # where u[w] and u[l] are the policy/reference probability ratios
-                # for the chosen and rejected samples, respectively.
-                logits -= F.softplus(chosen_logratios) - \
-                    F.softplus(rejected_logratios)
-
-        # The beta is a temperature parameter for the DPO loss, typically something in the range of 0.1 to 0.5.
-        # We ignore the reference model as beta -> 0. The label_smoothing parameter encodes our uncertainty about the
-        # labels and calculates a conservative DPO loss.
-        if loss_type == "sigmoid":
-            losses = (
-                -F.logsigmoid(self.beta * logits) * (1 - self.label_smoothing)
-                - F.logsigmoid(-self.beta * logits) * self.label_smoothing
-            )
-
-        elif loss_type == "robust":
-            losses = (
-                -F.logsigmoid(self.beta * logits) * (1 - self.label_smoothing)
-                + F.logsigmoid(-self.beta * logits) * self.label_smoothing
-            ) / (1 - 2 * self.label_smoothing)
-
-        elif loss_type == "exo_pair":
-            # eqn (16) of the EXO paper: https://huggingface.co/papers/2402.00856
-            import math
-
-            if self.label_smoothing == 0:
-                self.label_smoothing = 1e-3
-            losses = (self.beta * logits).sigmoid() * (
-                F.logsigmoid(self.beta * logits) -
-                math.log(1 - self.label_smoothing)
-            ) + (-self.beta * logits).sigmoid() * (
-                F.logsigmoid(-self.beta * logits) -
-                math.log(self.label_smoothing)
-            )
-
-        elif loss_type == "hinge":
-            losses = torch.relu(1 - self.beta * logits)
-
-        elif loss_type == "ipo":
-            # eqn (17) of the paper where beta is the regularization parameter for the IPO loss, denoted by tau in the paper.
-            losses = (logits - 1 / (2 * self.beta)) ** 2
-
-        elif loss_type == "bco_pair":
-            chosen_logratios = chosen_logps - ref_chosen_logps
-            rejected_logratios = rejected_logps - ref_rejected_logps
-            chosen_rewards = self.beta * chosen_logratios
-            rejected_rewards = self.beta * rejected_logratios
-            rewards = torch.cat(
-                (chosen_rewards, rejected_rewards), 0).mean().detach()
-            self.running.update(rewards)
-            delta = self.running.mean
-            losses = -F.logsigmoid(
-                (self.beta * chosen_logratios) - delta
-            ) - F.logsigmoid(-(self.beta * rejected_logratios - delta))
-
-        elif loss_type == "sppo_hard":
-            # In the paper (https://huggingface.co/papers/2405.00675), SPPO employs a soft probability approach,
-            # estimated using the PairRM score. The probability calculation is conducted outside of the trainer class.
-            # The version described here is the hard probability version, where P in Equation (4.7) of Algorithm 1 is
-            # set to 1 for the winner and 0 for the loser.
-            a = chosen_logps - ref_chosen_logps
-            b = rejected_logps - ref_rejected_logps
-            losses = (a - 0.5 / self.beta) ** 2 + (b + 0.5 / self.beta) ** 2
-
-        elif loss_type == "nca_pair":
-            chosen_rewards = (chosen_logps - ref_chosen_logps) * self.beta
-            rejected_rewards = (
-                rejected_logps - ref_rejected_logps) * self.beta
-            losses = (
-                -F.logsigmoid(chosen_rewards)
-                - 0.5 * F.logsigmoid(-chosen_rewards)
-                - 0.5 * F.logsigmoid(-rejected_rewards)
-            )
-
-        elif loss_type == "aot_pair":
-            chosen_logratios = chosen_logps - ref_chosen_logps
-            rejected_logratios = rejected_logps - ref_rejected_logps
-            chosen_logratios_sorted, _ = torch.sort(chosen_logratios, dim=0)
-            rejected_logratios_sorted, _ = torch.sort(
-                rejected_logratios, dim=0)
-            delta = chosen_logratios_sorted - rejected_logratios_sorted
-            losses = (
-                -F.logsigmoid(self.beta * delta) * (1 - self.label_smoothing)
-                - F.logsigmoid(-self.beta * delta) * self.label_smoothing
-            )
-
-        elif loss_type == "aot":
-            logratios = chosen_logps - rejected_logps
-            ref_logratios = ref_chosen_logps - ref_rejected_logps
-            logratios_sorted, _ = torch.sort(logratios, dim=0)
-            ref_logratios_sorted, _ = torch.sort(ref_logratios, dim=0)
-            delta = logratios_sorted - ref_logratios_sorted
-            losses = (
-                -F.logsigmoid(self.beta * delta) * (1 - self.label_smoothing)
-                - F.logsigmoid(-self.beta * delta) * self.label_smoothing
-            )
-
-        elif loss_type == "apo_zero":
-            # Eqn (7) of the APO paper (https://huggingface.co/papers/2408.06266)
-            # Use this loss when you believe the chosen outputs are better than your model's default output
-            losses_chosen = 1 - F.sigmoid(
-                self.beta * chosen_logratios
-            )  # Increase chosen likelihood
-            losses_rejected = F.sigmoid(
-                self.beta * rejected_logratios
-            )  # Decrease rejected likelihood
-            losses = losses_chosen + losses_rejected
-
-        elif loss_type == "apo_down":
-            # Eqn (8) of the APO paper (https://huggingface.co/papers/2408.06266)
-            # Use this loss when you believe the chosen outputs are worse than your model's default output.
-            # Decrease chosen likelihood and decrease rejected likelihood more
-            losses_chosen = F.sigmoid(self.beta * chosen_logratios)
-            losses_rejected = 1 - F.sigmoid(
-                self.beta * (chosen_logratios - rejected_logratios)
-            )
-            losses = losses_chosen + losses_rejected
-
-        elif loss_type == "discopop":
-            # Eqn (5) of the DiscoPOP paper (https://huggingface.co/papers/2406.08414)
-            # This loss was discovered with LLM discovery
-            logratios = chosen_logps - rejected_logps
-            ref_logratios = ref_chosen_logps - ref_rejected_logps
-            logits = logratios - ref_logratios
-            logits = logits * self.beta
-            # Modulate the mixing coefficient based on the log ratio magnitudes
-            log_ratio_modulation = torch.sigmoid(
-                logits / self.args.discopop_tau)
-            logistic_component = -F.logsigmoid(logits)
-            exp_component = torch.exp(-logits)
-            # Blend between logistic and exponential component based on log ratio modulation
-            losses = (
-                logistic_component * (1 - log_ratio_modulation)
-                + exp_component * log_ratio_modulation
-            )
-
-        elif loss_type == "sft":
-            # SFT loss is the negative log likelihood loss on chosen responses
-            # This acts as the generation loss component in MPO
-            # sft_loss = model_output["nll_loss"]
-            # Create losses tensor with same shape as other losses (per-sample)
-            # batch_size = chosen_logps.shape[0]
-            # losses = sft_loss.expand(batch_size)
-
-            losses = -chosen_logps
-            # For SFT, we don't have preference rewards, so use zeros
-            chosen_rewards = torch.zeros_like(chosen_logps)
-            rejected_rewards = torch.zeros_like(rejected_logps)
-
-        else:
-            raise ValueError(
-                f"Unknown loss type: {self.loss_type}. Should be one of ['sigmoid', 'hinge', 'ipo', 'exo_pair', "
-                "'nca_pair', 'robust', 'bco_pair', 'sppo_hard', 'aot', 'aot_pair', 'discopop', 'apo_zero', "
-                "'apo_down', 'sft']"
-            )
-
-        chosen_rewards = (
-            self.beta * (chosen_logps.to(device) -
-                         ref_chosen_logps.to(device)).detach()
-        )
-        rejected_rewards = (
-            self.beta
-            * (rejected_logps.to(device) - ref_rejected_logps.to(device)).detach()
-        )
-
-        return losses, chosen_rewards, rejected_rewards

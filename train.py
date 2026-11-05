@@ -30,10 +30,12 @@ import trl
 from data.data_mixture import get_dataset, ScriptArguments
 from model.modeling_fastdllm import Fast_dLLM_QwenForCausalLM
 from torch import distributed as dist
+from trainer.distributed_dtrpo_trainer import FastDLLMDistributedDTRPOTrainer
 from trainer.dpo_fast_dllm_trainer import FastDLLMDPOTrainer
-from trainer.dpo_llada_trainer import DLDPOConfig, DLDPOTrainer
+from trainer.dpo_base import DLDPOConfig
+from trainer.dpo_llada_trainer import DPOLLaDATrainer
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from trl import get_kbit_device_map, get_quantization_config, TrlParser
+from trl import TrlParser
 
 try:
     from trl.trainer.utils import SIMPLE_QUERY_CHAT_TEMPLATE as SIMPLE_CHAT_TEMPLATE
@@ -56,7 +58,7 @@ class ModelConfig(trl.ModelConfig):
     """Model-related arguments."""
     model_type: Optional[str] = field(
         default=None,
-        metadata={"help": "Model architecture: 'fastdllm' or 'LLaDA'"},
+        metadata={"help": "Model architecture: 'fastdllm' or 'llada'"},
     )
     mlp_only: bool = field(
         default=False,
@@ -64,16 +66,13 @@ class ModelConfig(trl.ModelConfig):
     )
     dtype: Optional[str] = field(
         default=None,
-        metadata={"help": "Model dtype override (e.g. 'bfloat16'). Alias for torch_dtype."},
+        metadata={"help": "Model loading dtype (e.g. 'bfloat16', 'float32', or 'auto')."},
+    )
+    trainer_type: str = field(
+        default="standard",
+        metadata={"help": "Trainer implementation: 'standard' or 'distributed_dtrpo'."},
     )
 
-    def __post_init__(self):
-        # Sync dtype alias with torch_dtype
-        if self.dtype is not None and self.torch_dtype is None:
-            self.torch_dtype = self.dtype
-        elif self.torch_dtype is not None and self.dtype is None:
-            self.dtype = self.torch_dtype
-        super().__post_init__()
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +80,7 @@ class ModelConfig(trl.ModelConfig):
 # ---------------------------------------------------------------------------
 
 def main(script_args, training_args, model_args):
+    model_args.model_type = (model_args.model_type or "").lower()
     # ── Dataset ──────────────────────────────────────────────────────────
     dataset = get_dataset(script_args)
 
@@ -113,7 +113,7 @@ def main(script_args, training_args, model_args):
             torch_dtype=torch_dtype,
             use_cache=not (
                 training_args.gradient_checkpointing
-                or model_args.model_type == "LLaDA"
+                or model_args.model_type == "llada"
             ),
             device_map=None,
         )
@@ -131,7 +131,7 @@ def main(script_args, training_args, model_args):
         raise ValueError(f"Unknown model_type: {model_args.model_type}")
 
     # LLaDA activation checkpointing
-    if model_args.model_type == "LLaDA" and training_args.gradient_checkpointing:
+    if model_args.model_type == "llada" and training_args.gradient_checkpointing:
         cfg = AutoConfig.from_pretrained(
             model_args.model_name_or_path, trust_remote_code=True
         )
@@ -145,21 +145,14 @@ def main(script_args, training_args, model_args):
         model.model.gradient_checkpointing = True
         training_args.gradient_checkpointing = False
 
-    if torch_dtype == torch.bfloat16:
-        model.bfloat16()
-    else:
-        model.half()
-
     # Reference model (for DPO KL divergence)
-    ref_model.training = False
-    if torch_dtype == torch.bfloat16:
-        ref_model.bfloat16()
-    else:
-        ref_model.half()
+    ref_model.train(model_args.model_type == "fastdllm")
+    ref_model.requires_grad_(False)
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         trust_remote_code=model_args.trust_remote_code,
+        fix_mistral_regex=True,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -186,9 +179,19 @@ def main(script_args, training_args, model_args):
 
     # ── Training ─────────────────────────────────────────────────────────
     if model_args.model_type == "llada":
-        trainer_cls = DLDPOTrainer
+        if model_args.trainer_type != "standard":
+            raise ValueError("--trainer_type distributed_dtrpo requires --model_type fastdllm")
+        trainer_cls = DPOLLaDATrainer
     elif model_args.model_type == "fastdllm":
-        trainer_cls = FastDLLMDPOTrainer
+        if model_args.trainer_type == "standard":
+            trainer_cls = FastDLLMDPOTrainer
+        elif model_args.trainer_type == "distributed_dtrpo":
+            trainer_cls = FastDLLMDistributedDTRPOTrainer
+        else:
+            raise ValueError(
+                f"Unknown trainer_type: {model_args.trainer_type!r}. "
+                "Expected 'standard' or 'distributed_dtrpo'."
+            )
     else:
         raise ValueError(f"Unknown model_type: {model_args.model_type}")
 
@@ -205,7 +208,7 @@ def main(script_args, training_args, model_args):
         processing_class=tokenizer,
     )
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
 
     if training_args.eval_strategy != "no":
         metrics = trainer.evaluate()
@@ -234,9 +237,14 @@ def make_parser(subparsers: argparse._SubParsersAction = None):
 
 
 if __name__ == "__main__":
-    dist.init_process_group(
-        backend="cpu:gloo,cuda:nccl", timeout=datetime.timedelta(hours=8)
-    )
     parser = make_parser()
     script_args, training_args, model_args = parser.parse_args_and_config()
-    main(script_args, training_args, model_args)
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1 and not dist.is_initialized():
+        dist.init_process_group(
+            backend="cpu:gloo,cuda:nccl", timeout=datetime.timedelta(hours=8)
+        )
+    try:
+        main(script_args, training_args, model_args)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()

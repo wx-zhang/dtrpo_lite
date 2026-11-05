@@ -1,10 +1,9 @@
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Optional, Union
+from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange, repeat
 
 from model.config_fastdllm import Fast_dLLM_QwenConfig
 from torch import nn
@@ -23,7 +22,7 @@ from transformers.modeling_outputs import (
 from transformers.modeling_rope_utils import dynamic_rope_update, ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils import auto_docstring, can_return_tuple, logging
+from transformers.utils import can_return_tuple, logging
 
 logger = logging.get_logger(__name__)
 # Disable only remote cache (keep local cache)
@@ -41,7 +40,7 @@ class BaseModelOutputWithPastAndBlockCache(BaseModelOutputWithPast):
 
 
 # @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
-@torch.compile(fullgraph=True)
+@torch.compile(fullgraph=True, mode="default")
 def fused_flex_attention(q, k, v, mask=None):
     return flex_attention(q, k, v, block_mask=mask, enable_gqa=True)
 
@@ -675,6 +674,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         replace_position: Optional[int] = None,
         mask_id: Optional[int] = 151665,
         precomputed_noisy_input_ids: Optional[torch.LongTensor] = None,
+        compute_loss: Optional[bool] = True,
         **kwargs,
     ) -> CausalLMOutputWithPastAndBlockCache:
         if self.training:
@@ -700,7 +700,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
 
                 mask_indices = torch.rand((b, l), device=input_ids.device) < p_mask
 
-                x_t = torch.where(mask_indices, mask_id, input_ids).reshape(labels.shape)
+                x_t = torch.where(mask_indices, mask_id, input_ids).to(input_ids.dtype).reshape(labels.shape)
                 noisy_input_ids[labels != -100] = x_t[labels != -100]
                 nomask = noisy_input_ids != mask_id
                 labels[nomask] = -100
@@ -769,7 +769,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
-        if labels is not None:
+        if labels is not None and compute_loss:
             # Ensure labels are on the same device as logits (needed for FSDP ref_model)
             if labels.device != logits.device:
                 labels = labels.to(logits.device)

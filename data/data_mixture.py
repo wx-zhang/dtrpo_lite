@@ -265,7 +265,10 @@ def get_dataset(args: ScriptArguments) -> DatasetDict:
                     i / sum(weighted_streaming) for i in weighted_streaming
                 ]
                 combined_dataset = interleave_datasets(
-                    datasets_list, probabilities=weighted_streaming
+                    datasets_list,
+                    probabilities=weighted_streaming,
+                    seed=seed,
+                    stopping_strategy="all_exhausted",
                 )
             else:
                 combined_dataset = concatenate_datasets(datasets_list)

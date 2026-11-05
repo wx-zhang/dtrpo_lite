@@ -1,0 +1,15 @@
+group: dtrpo_minerva_math_boxed_prompt_math_verify
+task:
+  - dtrpo_minerva_math_boxed_prompt_math_verify_algebra
+  - dtrpo_minerva_math_boxed_prompt_math_verify_counting_and_probability
+  - dtrpo_minerva_math_boxed_prompt_math_verify_geometry
+  - dtrpo_minerva_math_boxed_prompt_math_verify_intermediate_algebra
+  - dtrpo_minerva_math_boxed_prompt_math_verify_number_theory
+  - dtrpo_minerva_math_boxed_prompt_math_verify_prealgebra
+  - dtrpo_minerva_math_boxed_prompt_math_verify_precalculus
+aggregate_metric_list:
+  - metric: math_verify
+    aggregation: mean
+    weight_by_size: true
+metadata:
+  version: 1.0

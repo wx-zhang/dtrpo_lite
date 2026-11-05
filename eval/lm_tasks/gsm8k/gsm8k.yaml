@@ -1,0 +1,21 @@
+task: dtrpo_gsm8k_boxed_prompt_math_verify
+dataset_path: openai/gsm8k
+dataset_name: main
+output_type: generate_until
+training_split: train
+test_split: test
+doc_to_text: !function utils.gsm_doc_to_text
+doc_to_target: "{{answer}}"
+process_results: !function utils.process_gsm_results
+generation_kwargs:
+  until: ["Question:", "</s>", "<|im_end|>"]
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 2048
+num_fewshot: 0
+metric_list:
+  - metric: math_verify
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0
