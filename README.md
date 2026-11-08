@@ -90,7 +90,7 @@ $$
 Define a weight with **stop-gradient** and a surrogate loss:
 
 $$
-w_i=\operatorname{stopgrad}\!\left[\beta\sigma(-\beta\Delta_i)\right],
+w_i=\text{stopgrad}\left[\beta\sigma(-\beta\Delta_i)\right],
 \qquad
 \mathcal L_{\mathrm{sur}}
 =\frac{1}{BM}\sum_{i=1}^{B}\sum_{m=1}^{M}
