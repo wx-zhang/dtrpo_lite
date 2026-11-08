@@ -1,6 +1,6 @@
 # dTRPO Lite: Distributed Training and Evaluation with a Single Node
 
-[![Paper](https://img.shields.io/badge/Notion.svg)](https://app.notion.com/p/dTRPO-Lite-Distributed-Monte-Carlo-Estimation-40f383d2887a80c19a2cf2a23f186951?source=copy_link)
+[![Blog](https://shields.io)](https://app.notion.com/p/dTRPO-Lite-Distributed-Monte-Carlo-Estimation-40f383d2887a80c19a2cf2a23f186951?source=copy_link)
 [![Model](https://img.shields.io/badge/Hugging%20Face-dTRPO--Lite-yellow.svg)](https://huggingface.co/wxzhang/Fast-dLLM-v2-7B-dTRPO-Lite)
 
 This repository is a follow-up to the original **dTRPO: Trajectory Reduction
